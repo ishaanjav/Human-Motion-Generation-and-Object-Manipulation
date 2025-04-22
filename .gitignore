@@ -6,3 +6,11 @@ venv
 evaluation_*
 cache
 eval_model
+slurm_logs
+*.out
+*.err
+*.log
+*.txt
+*.json
+*.yaml
+*.yml

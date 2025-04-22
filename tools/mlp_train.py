@@ -4,12 +4,31 @@ import torch
 import lightning.pytorch as pl
 import torch.optim as optim
 from collections import OrderedDict
-from datasets import DataModule
+from torch.utils.data import Dataset, DataLoader
+import numpy as np
 from configs import get_config
 from os.path import join as pjoin
 from torch.utils.tensorboard import SummaryWriter
 from models import *
 from models.mlp_head import MLPHead
+
+class NPYDataset(Dataset):
+    def __init__(self, npy_path):
+        """Load data from the saved numpy file"""
+        self.samples = np.load(npy_path, allow_pickle=True)
+        print(f"Loaded {len(self.samples)} samples from {npy_path}")
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        sample = self.samples[idx]
+        return {
+            "noisy_pose": torch.from_numpy(sample["noisy_pose"].squeeze()),
+            "clean_pose": torch.from_numpy(sample["clean_pose"].squeeze()),
+            "object_bps": torch.from_numpy(sample["object_bps"].squeeze()),
+            "object_motion": torch.from_numpy(sample["object_motion"].squeeze())
+        }
 
 class LitMLPModel(pl.LightningModule):
     def __init__(self, intergen_model, mlp_head, cfg):
@@ -38,46 +57,61 @@ class LitMLPModel(pl.LightningModule):
         return self._configure_optim()
 
     def forward(self, batch_data):
+        # Process the input data directly since we're using our custom dataset
+        noisy_pose = batch_data["noisy_pose"]  # shape: (batch_size, 204)
+        object_bps = batch_data["object_bps"]
+        object_motion = batch_data["object_motion"]
+        
         # Get motion outputs from InterGen
         with torch.no_grad():
-            intergen_output = self.intergen_model.forward_test(batch_data)
-            motion_output = intergen_output["output"]  # Shape: B, T, nfeats*2
+            batch_size = noisy_pose.shape[0]
+            window_size = 210  # Same as in infer.py
             
-        # Split InterGen output into first and last 256 dimensions
-        first_half = motion_output[..., :256]  # First 256 dimensions
-        second_half = motion_output[..., 256:]  # Last 256 dimensions
+            intergen_input = OrderedDict({
+                "motion_lens": torch.ones(batch_size, 1).long().to(noisy_pose.device) * window_size,
+                "text": ["The people carry a box"] * batch_size  # Same text for all samples in batch
+            })
+            
+            intergen_output = self.intergen_model.forward_test(intergen_input)
+            motion_output = intergen_output["output"]  # shape: (batch_size, seq_len, 524)
+            print("InterGen output shape:", motion_output.shape)
+            
+        # Split InterGen output into first and last 262 dimensions (524/2)
+        # motion_output shape is (batch_size, seq_len, 524)
+        first_half = motion_output[..., :262]  # (batch_size, seq_len, 262)
+        second_half = motion_output[..., 262:]  # (batch_size, seq_len, 262)
         
         # Process first half through MLP
-        mlp_output = self.mlp_head(first_half)
+        # Reshape to process all timesteps through MLP
+        batch_time_size = first_half.shape[0] * first_half.shape[1]
+        first_half_reshaped = first_half.reshape(batch_time_size, -1)  # (batch_size * seq_len, 262)
+        mlp_output = self.mlp_head(first_half_reshaped)  # (batch_size * seq_len, 262)
+        mlp_output = mlp_output.reshape(first_half.shape)  # (batch_size, seq_len, 262)
         
         # Concatenate MLP output with untouched second half
-        final_output = torch.cat([mlp_output, second_half], dim=-1)
+        final_output = torch.cat([mlp_output, second_half], dim=-1)  # (batch_size, seq_len, 524)
         
         return final_output
 
     def training_step(self, batch, batch_idx):
-        # Get MLP output (which includes both processed first half and untouched second half)
-        mlp_output = self.forward(batch)
+        # Get MLP output
+        mlp_output = self.forward(batch)  # shape: (batch_size, seq_len, 524)
         
-        # Split both the output and target into first and second halves
-        output_first_half = mlp_output[..., :256]  # MLP processed part
-        output_second_half = mlp_output[..., 256:]  # Untouched part
+        # Get target from batch and expand it to match sequence length
+        target = batch["clean_pose"]  # shape: (batch_size, 204)
+        seq_len = mlp_output.shape[1]
+        target = target.unsqueeze(1).expand(-1, seq_len, -1)  # shape: (batch_size, seq_len, 204)
         
-        target_first_half = batch["target"][..., :256]  # Target for first half
-        target_second_half = batch["target"][..., 256:]  # Target for second half
+        # Split output and target
+        output_first_half = mlp_output[..., :262]  # (batch_size, seq_len, 262)
+        target_first_half = target[..., :262]  # (batch_size, seq_len, 262)
         
-        # Calculate loss only on the first half (MLP processed part)
+        # Calculate loss only on the first half
         loss = torch.nn.MSELoss()(output_first_half, target_first_half)
         
-        # Verify that second half remains unchanged
-        assert torch.allclose(output_second_half, batch["target"][..., 256:]), "Second half should remain unchanged"
+        # Log the loss
+        self.log("train_loss", loss, prog_bar=True)
         
-        opt = self.optimizers()
-        opt.zero_grad()
-        self.manual_backward(loss)
-        torch.nn.utils.clip_grad_norm_(self.mlp_head.parameters(), 0.5)
-        opt.step()
-
         return {"loss": loss}
 
     def on_train_batch_end(self, outputs, batch, batch_idx):
@@ -92,11 +126,11 @@ def build_models(cfg):
         intergen_model.load_state_dict(ckpt["state_dict"], strict=False)
         print("InterGen checkpoint loaded!")
     
-    # Create MLP head that processes first 256 dimensions
+    # Create MLP head that processes first 262 dimensions
     mlp_head = MLPHead(
-        input_dim=256,  # Process first 256 dimensions
+        input_dim=262,  # Process first 262 dimensions
         hidden_dims=[1024, 512],
-        output_dim=256  # Output 256 dimensions
+        output_dim=262  # Output 262 dimensions
     )
     
     return intergen_model, mlp_head
@@ -104,16 +138,35 @@ def build_models(cfg):
 if __name__ == '__main__':
     model_cfg = get_config("configs/model.yaml")
     train_cfg = get_config("configs/train.yaml")
-    data_cfg = get_config("configs/datasets.yaml").your_dataset  # You'll need to create this
-
+    
     # Build models
     intergen_model, mlp_head = build_models(model_cfg)
     
     # Create Lightning model
     litmodel = LitMLPModel(intergen_model, mlp_head, train_cfg)
     
-    # Create datamodule for your new dataset
-    datamodule = DataModule(data_cfg, train_cfg.TRAIN.BATCH_SIZE, train_cfg.TRAIN.NUM_WORKERS)
+    # Create dataset and dataloader
+    npy_path = "/scratch/gpfs/ij9461/chois_release/samples/first_500_samples.npy"
+    dataset = NPYDataset(npy_path)
+    
+    # Split dataset into train and validation
+    train_size = int(0.8 * len(dataset))
+    val_size = len(dataset) - train_size
+    train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
+    
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=train_cfg.TRAIN.BATCH_SIZE,
+        shuffle=True,
+        num_workers=train_cfg.TRAIN.NUM_WORKERS
+    )
+    
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=train_cfg.TRAIN.BATCH_SIZE,
+        shuffle=False,
+        num_workers=train_cfg.TRAIN.NUM_WORKERS
+    )
     
     # Setup trainer
     trainer = pl.Trainer(
@@ -121,8 +174,8 @@ if __name__ == '__main__':
         devices="auto", 
         accelerator='gpu',
         max_epochs=train_cfg.TRAIN.EPOCH,
-        strategy=DDPStrategy(find_unused_parameters=True),
+        strategy="ddp",
         precision=32,
     )
 
-    trainer.fit(model=litmodel, datamodule=datamodule)
+    trainer.fit(model=litmodel, train_dataloaders=train_loader, val_dataloaders=val_loader)
