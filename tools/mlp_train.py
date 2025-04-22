@@ -60,7 +60,7 @@ class LitMLPModel(pl.LightningModule):
         # Process the input data directly since we're using our custom dataset
         noisy_pose = batch_data["noisy_pose"]  # shape: (batch_size, 204)
         object_bps = batch_data["object_bps"]
-        object_motion = batch_data["object_motion"]
+        object_motion = batch_data["object_motion"]  # shape: (batch_size, 12)
         
         # Get motion outputs from InterGen
         with torch.no_grad():
@@ -79,10 +79,17 @@ class LitMLPModel(pl.LightningModule):
         # Take first 262 dimensions from InterGen output
         first_half = motion_output[..., :262]  # (batch_size, seq_len, 262)
         
+        # Expand object_motion to match sequence length
+        seq_len = first_half.shape[1]
+        object_motion_expanded = object_motion.unsqueeze(1).expand(-1, seq_len, -1)  # (batch_size, seq_len, 12)
+        
+        # Concatenate InterGen output with object_motion
+        mlp_input = torch.cat([first_half, object_motion_expanded], dim=-1)  # (batch_size, seq_len, 274)
+        
         # Process through MLP to get human pose
-        batch_time_size = first_half.shape[0] * first_half.shape[1]
-        first_half_reshaped = first_half.reshape(batch_time_size, -1)  # (batch_size * seq_len, 262)
-        mlp_output = self.mlp_head(first_half_reshaped)  # (batch_size * seq_len, 204)
+        batch_time_size = mlp_input.shape[0] * mlp_input.shape[1]
+        mlp_input_reshaped = mlp_input.reshape(batch_time_size, -1)  # (batch_size * seq_len, 274)
+        mlp_output = self.mlp_head(mlp_input_reshaped)  # (batch_size * seq_len, 204)
         mlp_output = mlp_output.reshape(batch_size, -1, 204)  # (batch_size, seq_len, 204)
         
         return mlp_output
@@ -116,9 +123,9 @@ def build_models(cfg):
         intergen_model.load_state_dict(ckpt["state_dict"], strict=False)
         print("InterGen checkpoint loaded!")
     
-    # Create MLP head that takes 262 dimensions and outputs 204 dimensions (human pose)
+    # Create MLP head that takes 262 (InterGen) + 12 (object_motion) = 274 dimensions
     mlp_head = MLPHead(
-        input_dim=262,  # Process first 262 dimensions from InterGen
+        input_dim=274,  # 262 from InterGen + 12 from object_motion
         hidden_dims=[1024, 512],
         output_dim=204  # Output human pose dimensions
     )
