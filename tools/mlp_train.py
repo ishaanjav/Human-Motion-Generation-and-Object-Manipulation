@@ -76,38 +76,28 @@ class LitMLPModel(pl.LightningModule):
             motion_output = intergen_output["output"]  # shape: (batch_size, seq_len, 524)
             print("InterGen output shape:", motion_output.shape)
             
-        # Split InterGen output into first and last 262 dimensions (524/2)
-        # motion_output shape is (batch_size, seq_len, 524)
+        # Take first 262 dimensions from InterGen output
         first_half = motion_output[..., :262]  # (batch_size, seq_len, 262)
-        second_half = motion_output[..., 262:]  # (batch_size, seq_len, 262)
         
-        # Process first half through MLP
-        # Reshape to process all timesteps through MLP
+        # Process through MLP to get human pose
         batch_time_size = first_half.shape[0] * first_half.shape[1]
         first_half_reshaped = first_half.reshape(batch_time_size, -1)  # (batch_size * seq_len, 262)
-        mlp_output = self.mlp_head(first_half_reshaped)  # (batch_size * seq_len, 262)
-        mlp_output = mlp_output.reshape(first_half.shape)  # (batch_size, seq_len, 262)
+        mlp_output = self.mlp_head(first_half_reshaped)  # (batch_size * seq_len, 204)
+        mlp_output = mlp_output.reshape(batch_size, -1, 204)  # (batch_size, seq_len, 204)
         
-        # Concatenate MLP output with untouched second half
-        final_output = torch.cat([mlp_output, second_half], dim=-1)  # (batch_size, seq_len, 524)
-        
-        return final_output
+        return mlp_output
 
     def training_step(self, batch, batch_idx):
         # Get MLP output
-        mlp_output = self.forward(batch)  # shape: (batch_size, seq_len, 524)
+        mlp_output = self.forward(batch)  # shape: (batch_size, seq_len, 204)
         
         # Get target from batch and expand it to match sequence length
         target = batch["clean_pose"]  # shape: (batch_size, 204)
         seq_len = mlp_output.shape[1]
         target = target.unsqueeze(1).expand(-1, seq_len, -1)  # shape: (batch_size, seq_len, 204)
         
-        # Split output and target
-        output_first_half = mlp_output[..., :262]  # (batch_size, seq_len, 262)
-        target_first_half = target[..., :262]  # (batch_size, seq_len, 262)
-        
-        # Calculate loss only on the first half
-        loss = torch.nn.MSELoss()(output_first_half, target_first_half)
+        # Calculate loss between predicted pose and target pose
+        loss = torch.nn.MSELoss()(mlp_output, target)
         
         # Log the loss
         self.log("train_loss", loss, prog_bar=True)
@@ -126,11 +116,11 @@ def build_models(cfg):
         intergen_model.load_state_dict(ckpt["state_dict"], strict=False)
         print("InterGen checkpoint loaded!")
     
-    # Create MLP head that processes first 262 dimensions
+    # Create MLP head that takes 262 dimensions and outputs 204 dimensions (human pose)
     mlp_head = MLPHead(
-        input_dim=262,  # Process first 262 dimensions
+        input_dim=262,  # Process first 262 dimensions from InterGen
         hidden_dims=[1024, 512],
-        output_dim=262  # Output 262 dimensions
+        output_dim=204  # Output human pose dimensions
     )
     
     return intergen_model, mlp_head
