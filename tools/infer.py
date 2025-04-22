@@ -5,6 +5,7 @@ sys.path.append(sys.path[0] + r"/../")
 import torch
 import lightning as L
 import scipy.ndimage.filters as filters
+from datetime import datetime
 
 from os.path import join as pjoin
 from models import *
@@ -59,9 +60,9 @@ class LitGenModel(L.LightningModule):
 
         window_size = 210
         motion_output = self.generate_loop(batch, window_size)
-        result_path = f"results/{name}.mp4"
-        if not os.path.exists("results"):
-            os.makedirs("results")
+        
+        # Use the timestamp folder created in main
+        result_path = os.path.join("results", timestamp, f"{name}.mp4")
 
         self.plot_t2m([motion_output[0], motion_output[1]],
                       result_path,
@@ -116,13 +117,29 @@ if __name__ == '__main__':
 
     litmodel = LitGenModel(model, infer_cfg).to(torch.device("cuda:0"))
 
+    # Fix: Look for prompts.txt in the root directory (one level up from tools/)
+    root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    prompts_file = os.path.join(root_dir, "prompts.txt")
+    
+    if not os.path.exists(prompts_file):
+        print(f"Error: Could not find prompts.txt at {prompts_file}")
+        print("Please create a prompts.txt file in the root directory with your desired text prompts (one per line)")
+        sys.exit(1)
 
-    with open(".\prompts.txt") as f:
+    with open(prompts_file) as f:
         texts = f.readlines()
     texts = [text.strip("\n") for text in texts]
+
+    # Create timestamp folder once for all generations
+    timestamp = datetime.now().strftime("%m-%d-%y_%H-%M")
+    result_dir = os.path.join("results", timestamp)
+    if not os.path.exists(result_dir):
+        os.makedirs(result_dir)
+        print(f"Created results directory: {result_dir}")
 
     for text in texts:
         name = text[:48]
         for i in range(3):
-            litmodel.generate_one_sample(text, name+"_"+str(i))
+            # Update generate_one_sample to use the existing result_dir
+            litmodel.generate_one_sample(text, name + f"_{i}")
 
