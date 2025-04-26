@@ -11,6 +11,7 @@ from os.path import join as pjoin
 from torch.utils.tensorboard import SummaryWriter
 from models import *
 from models.mlp_head import MLPHead
+from datetime import datetime
 
 class NPYDataset(Dataset):
     def __init__(self, npy_path):
@@ -58,13 +59,13 @@ class LitMLPModel(pl.LightningModule):
 
     def forward(self, batch_data):
         # Process the input data directly since we're using our custom dataset
-        noisy_pose = batch_data["noisy_pose"]  # shape: (batch_size, 204)
+        noisy_pose = batch_data["noisy_pose"]  # shape: (batch_size=32, 204)
         object_bps = batch_data["object_bps"]
-        object_motion = batch_data["object_motion"]  # shape: (batch_size, 12)
+        object_motion = batch_data["object_motion"]  # shape: (batch_size=32, 12)
         
         # Get motion outputs from InterGen
         with torch.no_grad():
-            batch_size = noisy_pose.shape[0]
+            batch_size = noisy_pose.shape[0]  # Should be 32
             window_size = 210  # Same as in infer.py
             
             intergen_input = OrderedDict({
@@ -73,24 +74,21 @@ class LitMLPModel(pl.LightningModule):
             })
             
             intergen_output = self.intergen_model.forward_test(intergen_input)
-            motion_output = intergen_output["output"]  # shape: (batch_size, seq_len, 524)
+            motion_output = intergen_output["output"]  # shape: (batch_size=32, seq_len=210, 524)
             print("InterGen output shape:", motion_output.shape)
             
         # Take first 262 dimensions from InterGen output
-        first_half = motion_output[..., :262]  # (batch_size, seq_len, 262)
+        first_half = motion_output[..., :262]  # (batch_size=32, seq_len=210, 262)
         
-        # Expand object_motion to match sequence length
-        seq_len = first_half.shape[1]
-        object_motion_expanded = object_motion.unsqueeze(1).expand(-1, seq_len, -1)  # (batch_size, seq_len, 12)
-        
-        # Concatenate InterGen output with object_motion
-        mlp_input = torch.cat([first_half, object_motion_expanded], dim=-1)  # (batch_size, seq_len, 274)
+        # Concatenate first_half with object_motion for each timestep
+        object_motion_expanded = object_motion.unsqueeze(1).expand(-1, window_size, -1)  # (batch_size=32, seq_len=210, 12)
+        mlp_input = torch.cat([first_half, object_motion_expanded], dim=-1)  # (batch_size=32, seq_len=210, 274)
         
         # Process through MLP to get human pose
-        batch_time_size = mlp_input.shape[0] * mlp_input.shape[1]
-        mlp_input_reshaped = mlp_input.reshape(batch_time_size, -1)  # (batch_size * seq_len, 274)
-        mlp_output = self.mlp_head(mlp_input_reshaped)  # (batch_size * seq_len, 204)
-        mlp_output = mlp_output.reshape(batch_size, -1, 204)  # (batch_size, seq_len, 204)
+        # Reshape to (batch_size * seq_len, 274) for MLP
+        mlp_input_reshaped = mlp_input.reshape(-1, 274)  # (batch_size*seq_len, 274)
+        mlp_output = self.mlp_head(mlp_input_reshaped)  # (batch_size*seq_len, 204)
+        mlp_output = mlp_output.reshape(batch_size, window_size, 204)  # (batch_size=32, seq_len=210, 204)
         
         return mlp_output
 
@@ -111,6 +109,23 @@ class LitMLPModel(pl.LightningModule):
         
         return {"loss": loss}
 
+    def validation_step(self, batch, batch_idx):
+        # Get MLP output
+        mlp_output = self.forward(batch)  # shape: (batch_size, seq_len, 204)
+        
+        # Get target from batch and expand it to match sequence length
+        target = batch["clean_pose"]  # shape: (batch_size, 204)
+        seq_len = mlp_output.shape[1]
+        target = target.unsqueeze(1).expand(-1, seq_len, -1)  # shape: (batch_size, seq_len, 204)
+        
+        # Calculate validation loss
+        val_loss = torch.nn.MSELoss()(mlp_output, target)
+        
+        # Log the validation loss
+        self.log("val_loss", val_loss, prog_bar=True)
+        
+        return {"val_loss": val_loss}
+
     def on_train_batch_end(self, outputs, batch, batch_idx):
         if self.global_rank == 0:
             self.writer.add_scalar('train_loss', outputs['loss'], self.global_step)
@@ -126,7 +141,7 @@ def build_models(cfg):
     # Create MLP head that takes 262 (InterGen) + 12 (object_motion) = 274 dimensions
     mlp_head = MLPHead(
         input_dim=274,  # 262 from InterGen + 12 from object_motion
-        hidden_dims=[1024, 512],
+        hidden_dims=[1024, 512, 512],
         output_dim=204  # Output human pose dimensions
     )
     
@@ -153,26 +168,40 @@ if __name__ == '__main__':
     
     train_loader = DataLoader(
         train_dataset,
-        batch_size=train_cfg.TRAIN.BATCH_SIZE,
+        batch_size=64,  # Fixed batch size of 64
         shuffle=True,
-        num_workers=train_cfg.TRAIN.NUM_WORKERS
+        num_workers=64,
+        pin_memory=True
     )
     
     val_loader = DataLoader(
         val_dataset,
-        batch_size=train_cfg.TRAIN.BATCH_SIZE,
+        batch_size=64,  # Fixed batch size of 64
         shuffle=False,
-        num_workers=train_cfg.TRAIN.NUM_WORKERS
+        num_workers=64,
+        pin_memory=True
     )
     
-    # Setup trainer
+    EXP_NAME = f"MLP-{datetime.now().strftime('%H:%M')}"
+    # Setup checkpointing
+    checkpoint_callback = pl.callbacks.ModelCheckpoint(
+        dirpath=pjoin(train_cfg.GENERAL.CHECKPOINT, EXP_NAME, 'mlp_checkpoints'),
+        filename='mlp-{epoch:02d}-{val_loss:.3f}',
+        save_top_k=3,
+        monitor='val_loss',
+        mode='min',
+        save_last=True,
+    )
+    
+    # Setup trainer with checkpointing
     trainer = pl.Trainer(
-        default_root_dir=pjoin(train_cfg.GENERAL.CHECKPOINT, train_cfg.GENERAL.EXP_NAME),
+        default_root_dir=pjoin(train_cfg.GENERAL.CHECKPOINT, EXP_NAME),
         devices="auto", 
         accelerator='gpu',
         max_epochs=train_cfg.TRAIN.EPOCH,
         strategy="ddp",
         precision=32,
+        callbacks=[checkpoint_callback],  # Add checkpoint callback
     )
 
     trainer.fit(model=litmodel, train_dataloaders=train_loader, val_dataloaders=val_loader)
