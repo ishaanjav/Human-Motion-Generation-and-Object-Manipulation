@@ -166,9 +166,12 @@ class InterDiffusion(nn.Module):
         self.sampler = cfg.SAMPLER
         self.sampling_strategy = sampling_strategy
 
+        # Main network
         self.net = InterDenoiser(self.nfeats, self.latent_dim, ff_size=self.ff_size, num_layers=self.num_layers,
                                        num_heads=self.num_heads, dropout=self.dropout, activation=self.activation, cfg_weight=self.cfg_weight)
 
+        # ControlNet
+        self.control_net = ControlNet(cfg) if cfg.USE_CONTROLNET else None
 
         self.diffusion_steps = self.diffusion_steps
         self.betas = get_named_beta_schedule(self.beta_scheduler, self.diffusion_steps)
@@ -210,14 +213,16 @@ class InterDiffusion(nn.Module):
         x_start = batch["motions"]
         B,T = batch["motions"].shape[:2]
 
-
         if cond is not None:
             cond, cond_mask = self.mask_cond(cond, 0.1)
-
 
         seq_mask = self.generate_src_mask(batch["motions"].shape[1], batch["motion_lens"]).to(x_start.device)
 
         t, _ = self.sampler.sample(B, x_start.device)
+        
+        # Get control signal if using ControlNet
+        control = batch.get("control", None)
+        
         output = self.diffusion.training_losses(
             model=self.net,
             x_start=x_start,
@@ -225,15 +230,16 @@ class InterDiffusion(nn.Module):
             mask=seq_mask,
             t_bar=self.cfg.T_BAR,
             cond_mask=cond_mask,
-            model_kwargs={"mask":seq_mask,
-                          "cond":cond,
-                          },
+            model_kwargs={
+                "mask": seq_mask,
+                "cond": cond,
+                "control": control
+            },
         )
         return output
 
     def forward(self, batch):
         cond = batch["cond"]
-        # x_start = batch["motions"]
         B = cond.shape[0]
         T = batch["motion_lens"][0]
 
@@ -249,17 +255,22 @@ class InterDiffusion(nn.Module):
         )
 
         self.cfg_model = ClassifierFreeSampleModel(self.net, self.cfg_weight)
+        
+        # Get control signal if using ControlNet
+        control = batch.get("control", None)
+        
         output = self.diffusion_test.ddim_sample_loop(
             self.cfg_model,
             (B, T, self.nfeats*2),
             clip_denoised=False,
             progress=True,
             model_kwargs={
-                "mask":None,
-                "cond":cond,
+                "mask": None,
+                "cond": cond,
+                "control": control
             },
             x_start=None)
-        return {"output":output}
+        return {"output": output}
 
 
 

@@ -1,0 +1,205 @@
+import sys
+sys.path.append(sys.path[0] + r"/../")
+import torch
+import lightning.pytorch as pl
+import torch.optim as optim
+from collections import OrderedDict
+from torch.utils.data import Dataset, DataLoader
+import numpy as np
+from configs import get_config
+from os.path import join as pjoin
+from torch.utils.tensorboard import SummaryWriter
+from models import *
+from models.controlnet import ControlNet
+from datetime import datetime
+
+class NPYDataset(Dataset):
+    def __init__(self, npy_path):
+        """Load data from the saved numpy file"""
+        self.samples = np.load(npy_path, allow_pickle=True)
+        print(f"Loaded {len(self.samples)} samples from {npy_path}")
+        
+        # Print shapes for debugging
+        sample = self.samples[0]
+        print("Sample shapes:")
+        print(f"noisy_pose: {sample['noisy_pose'].shape}")
+        print(f"clean_pose: {sample['clean_pose'].shape}")
+        print(f"object_bps: {sample['object_bps'].shape}")
+        print(f"object_motion: {sample['object_motion'].shape}")
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        sample = self.samples[idx]
+        return {
+            "noisy_pose": torch.from_numpy(sample["noisy_pose"]),  # shape: (seq_len, 204)
+            "clean_pose": torch.from_numpy(sample["clean_pose"]),  # shape: (seq_len, 204)
+            "object_bps": torch.from_numpy(sample["object_bps"]),  # shape: (seq_len, ?)
+            "object_motion": torch.from_numpy(sample["object_motion"])  # shape: (seq_len, 12)
+        }
+
+class LitControlModel(pl.LightningModule):
+    def __init__(self, intergen_model, control_net, cfg):
+        super().__init__()
+        self.cfg = cfg
+        self.intergen_model = intergen_model
+        self.control_net = control_net
+        
+        # Freeze InterGen model
+        for param in self.intergen_model.parameters():
+            param.requires_grad = False
+            
+        self.writer = SummaryWriter(pjoin(cfg.GENERAL.CHECKPOINT, cfg.GENERAL.EXP_NAME, 'log'))
+
+    def _configure_optim(self):
+        # Only optimize the control net parameters
+        optimizer = optim.AdamW(self.control_net.parameters(), 
+                              lr=float(self.cfg.TRAIN.LR), 
+                              weight_decay=self.cfg.TRAIN.WEIGHT_DECAY)
+        scheduler = CosineWarmupScheduler(optimizer=optimizer, 
+                                        warmup=10, 
+                                        max_iters=self.cfg.TRAIN.EPOCH, 
+                                        verbose=True)
+        return [optimizer], [scheduler]
+
+    def configure_optimizers(self):
+        return self._configure_optim()
+
+    def forward(self, batch_data):
+        # Process the input data
+        noisy_pose = batch_data["noisy_pose"]  # shape: (batch_size, seq_len, 204)
+        object_bps = batch_data["object_bps"]  # shape: (batch_size, seq_len, ?)
+        object_motion = batch_data["object_motion"]  # shape: (batch_size, seq_len, 12)
+        
+        batch_size, seq_len = noisy_pose.shape[:2]
+        
+        # Get motion outputs from InterGen
+        with torch.no_grad():
+            intergen_input = OrderedDict({
+                "motion_lens": torch.ones(batch_size, 1).long().to(noisy_pose.device) * seq_len,
+                "text": ["The people carry a box"] * batch_size  # Same text for all samples
+            })
+            
+            intergen_output = self.intergen_model.forward_test(intergen_input)
+            motion_output = intergen_output["output"]  # shape: (batch_size, seq_len, 524)
+            
+        # Take first 262 dimensions from InterGen output
+        first_half = motion_output[..., :262]  # (batch_size, seq_len, 262)
+        
+        # Process through ControlNet
+        control_output = self.control_net(
+            x=first_half,
+            timesteps=torch.zeros(batch_size).long().to(noisy_pose.device),  # Dummy timesteps
+            control=object_motion,  # Already in correct shape (batch_size, seq_len, 12)
+            mask=None,
+            cond=None
+        )
+        
+        return control_output
+
+    def training_step(self, batch, batch_idx):
+        # Get ControlNet output
+        control_output = self.forward(batch)  # shape: (batch_size, seq_len, 262)
+        
+        # Get target from batch (already in correct shape)
+        target = batch["clean_pose"]  # shape: (batch_size, seq_len, 204)
+        
+        # Calculate loss between predicted motion and target motion
+        loss = torch.nn.MSELoss()(control_output, target[..., :262])  # Only compare first 262 dimensions
+        
+        # Log the loss
+        self.log("train_loss", loss, prog_bar=True)
+        
+        return {"loss": loss}
+
+    def validation_step(self, batch, batch_idx):
+        # Get ControlNet output
+        control_output = self.forward(batch)  # shape: (batch_size, seq_len, 262)
+        
+        # Get target from batch (already in correct shape)
+        target = batch["clean_pose"]  # shape: (batch_size, seq_len, 204)
+        
+        # Calculate validation loss
+        val_loss = torch.nn.MSELoss()(control_output, target[..., :262])
+        
+        # Log the validation loss
+        self.log("val_loss", val_loss, prog_bar=True)
+        
+        return {"val_loss": val_loss}
+
+    def on_train_batch_end(self, outputs, batch, batch_idx):
+        if self.global_rank == 0:
+            self.writer.add_scalar('train_loss', outputs['loss'], self.global_step)
+
+def build_models(cfg):
+    # Load InterGen model
+    intergen_model = InterGen(cfg)
+    if cfg.CHECKPOINT:
+        ckpt = torch.load(cfg.CHECKPOINT, map_location="cpu")
+        intergen_model.load_state_dict(ckpt["state_dict"], strict=False)
+        print("InterGen checkpoint loaded!")
+    
+    # Create ControlNet
+    control_net = ControlNet(cfg)
+    
+    return intergen_model, control_net
+
+if __name__ == '__main__':
+    model_cfg = get_config("configs/control.yaml")
+    train_cfg = get_config("configs/train.yaml")
+    
+    # Build models
+    intergen_model, control_net = build_models(model_cfg)
+    
+    # Create Lightning model
+    litmodel = LitControlModel(intergen_model, control_net, train_cfg)
+    
+    # Create dataset and dataloader
+    npy_path = "/scratch/gpfs/ij9461/chois_release/samples/first_500_samples.npy"
+    dataset = NPYDataset(npy_path)
+    
+    # Split dataset into train and validation
+    train_size = int(0.8 * len(dataset))
+    val_size = len(dataset) - train_size
+    train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
+    
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=64,  # Fixed batch size of 64
+        shuffle=True,
+        num_workers=64,
+        pin_memory=True
+    )
+    
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=64,  # Fixed batch size of 64
+        shuffle=False,
+        num_workers=64,
+        pin_memory=True
+    )
+    
+    EXP_NAME = f"ControlNet-{datetime.now().strftime('%H:%M')}"
+    # Setup checkpointing
+    checkpoint_callback = pl.callbacks.ModelCheckpoint(
+        dirpath=pjoin(train_cfg.GENERAL.CHECKPOINT, EXP_NAME, 'control_checkpoints'),
+        filename='control-{epoch:02d}-{val_loss:.3f}',
+        save_top_k=3,
+        monitor='val_loss',
+        mode='min',
+        save_last=True,
+    )
+    
+    # Setup trainer with checkpointing
+    trainer = pl.Trainer(
+        default_root_dir=pjoin(train_cfg.GENERAL.CHECKPOINT, EXP_NAME),
+        devices="auto", 
+        accelerator='gpu',
+        max_epochs=train_cfg.TRAIN.EPOCH,
+        strategy="ddp",
+        precision=32,
+        callbacks=[checkpoint_callback],  # Add checkpoint callback
+    )
+
+    trainer.fit(model=litmodel, train_dataloaders=train_loader, val_dataloaders=val_loader) 
