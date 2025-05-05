@@ -1,12 +1,15 @@
 import torch
 import torch.nn as nn
-from .nets import InterDenoiser
 from .utils import zero_module
+from .intergen import InterGen
 
 class ControlNet(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
+        
+        # Import InterDenoiser here to avoid circular import
+        from .nets import InterDenoiser
         
         # Original network
         self.main_net = InterGen(cfg)  # Use full InterGen model

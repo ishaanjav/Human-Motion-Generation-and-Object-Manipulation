@@ -1,4 +1,5 @@
 import torch
+import torch.nn as nn
 
 from models.utils import *
 from models.cfg_sampler import ClassifierFreeSampleModel
@@ -169,9 +170,6 @@ class InterDiffusion(nn.Module):
         # Main network
         self.net = InterDenoiser(self.nfeats, self.latent_dim, ff_size=self.ff_size, num_layers=self.num_layers,
                                        num_heads=self.num_heads, dropout=self.dropout, activation=self.activation, cfg_weight=self.cfg_weight)
-
-        # ControlNet
-        self.control_net = ControlNet(cfg) if cfg.USE_CONTROLNET else None
 
         self.diffusion_steps = self.diffusion_steps
         self.betas = get_named_beta_schedule(self.beta_scheduler, self.diffusion_steps)

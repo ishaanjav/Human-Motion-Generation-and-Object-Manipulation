@@ -156,7 +156,7 @@ if __name__ == '__main__':
     litmodel = LitControlModel(intergen_model, control_net, train_cfg)
     
     # Create dataset and dataloader
-    npy_path = "/scratch/gpfs/ij9461/chois_release/samples/first_500_samples.npy"
+    npy_path = "/scratch/gpfs/ij9461/chois_release/samples/first_500_samples_old.npy"
     dataset = NPYDataset(npy_path)
     
     # Split dataset into train and validation
